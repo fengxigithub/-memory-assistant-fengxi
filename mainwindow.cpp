@@ -17,12 +17,16 @@
 #include <QSizePolicy> // 添加 QSizePolicy 头文件
 #include "imageviewerdialog.h"
 #include <QIcon>
+#include <QCoreApplication>
+#include <QTimer>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
     , m_isRefreshing(false)
     , m_imageViewer(nullptr)
+    , m_lastBackupDate()
+
 {
     ui->setupUi(this);
     qDebug() << "MainWindow constructed";
@@ -64,10 +68,14 @@ MainWindow::MainWindow(QWidget *parent)
     ui->labelImageDisplay->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     ui->labelImageDisplay->setAlignment(Qt::AlignCenter);
     ui->labelImageDisplay->setText("图片显示区域");
+    imageZoomFactor = 1.0;
 
     // 加载数据
     loadKnowledgePoints();
     qDebug() << "Loaded" << knowledgePoints.size() << "knowledge points";
+
+    // 每日复习
+    QTimer::singleShot(0, this, &MainWindow::startDailyReview);
 
     // 如果没有数据，显示提示
     if (knowledgePoints.isEmpty()) {
@@ -107,6 +115,8 @@ MainWindow::MainWindow(QWidget *parent)
     qDebug() << "MainWindow initialization completed";
 }
 
+
+//MainWindow类的析构函数 自动执行，用于销毁窗口
 MainWindow::~MainWindow()
 {
     saveKnowledgePoints();
@@ -116,13 +126,15 @@ MainWindow::~MainWindow()
 
 // 以下是所有槽函数的实现，只需要重命名即可
 
+// 槽函数：响应“添加”按钮点击，弹出对话框让用户输入新知识点信息
 void MainWindow::handleAddNew()
 {
     qDebug() << "handleAddNew called";
 
     bool ok;
+    //弹出对话框赋值
     QString title = QInputDialog::getText(this, "添加知识点", "请输入知识点标题:",
-                                          QLineEdit::Normal, "", &ok);
+                                          QLineEdit::Normal, "", &ok);  //这里是输入好标题后点击ok
 
     if (!ok) {
         qDebug() << "Add new cancelled by user";
@@ -143,9 +155,9 @@ void MainWindow::handleAddNew()
     }
 
     QString imagePath;
-    if (QMessageBox::question(this, "添加图片", "是否要添加图片?") == QMessageBox::Yes) {
+    if (QMessageBox::question(this, "添加图片", "是否要添加图片?") == QMessageBox::Yes) {  //这里返回值是yes,或者no，方便之后比对
         QString selectedImagePath = QFileDialog::getOpenFileName(this, "选择图片", "",
-                                                                 "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tiff)");
+                                                                 "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tiff)");//返回完整路径，并只筛选如下几个类型
         if (!selectedImagePath.isEmpty()) {
             // 复制图片到专用存储目录
             imagePath = copyImageToStorage(selectedImagePath);
@@ -163,6 +175,7 @@ void MainWindow::handleAddNew()
     qDebug() << "Add new completed";
 }
 
+// 槽函数：编辑当前选中的知识点
 void MainWindow::handleEditPoint()
 {
     QListWidgetItem *currentItem = ui->listKnowledgePoints->currentItem();
@@ -217,6 +230,7 @@ void MainWindow::handleEditPoint()
     editKnowledgePoint(id, title, content, imagePath, category);
 }
 
+// 槽函数：标记复习（已被三个具体按钮替代，实际未使用）
 void MainWindow::handleMarkReviewed()
 {
     qDebug() << "handleMarkReviewed called";
@@ -325,6 +339,10 @@ void MainWindow::handleClearSearch()
 
 void MainWindow::handleListSelectionChanged()
 {
+    if (m_isReviewMode) {
+        // 复习模式下只允许程序内部切换，忽略用户的手动选择
+        return;
+    }
     if (m_isRefreshing) {
         qDebug() << "Currently refreshing, skipping selection change";
         return;
@@ -430,61 +448,94 @@ void MainWindow::handleStatusChanged(int index)
 
 void MainWindow::handleCalendarClicked(const QDate &date)
 {
-    // 高亮显示需要复习的日期
-    QTextCharFormat format;
-    format.setBackground(Qt::yellow);
+    // 1. 先清除之前所有日期的高亮（避免颜色重叠或残留）
+    ui->calendarReview->setDateTextFormat(QDate(), QTextCharFormat());
 
+    // 2. 为所有需要复习的知识点设置高亮
+    QTextCharFormat reviewFormat;
+    reviewFormat.setBackground(Qt::yellow);
+
+    QDate today = QDate::currentDate();
     for (const auto &point : knowledgePoints) {
-        if (point.nextReviewDate == date && point.status != STATUS_MASTERED) {
-            ui->calendarReview->setDateTextFormat(date, format);
+        // 仅高亮未来(或今天)的复习日期，且知识点未掌握
+        if (point.nextReviewDate.isValid() &&
+            point.nextReviewDate >= today &&
+            point.status != STATUS_MASTERED)
+        {
+            ui->calendarReview->setDateTextFormat(point.nextReviewDate, reviewFormat);
         }
     }
+
+    // 3. 如果你还想特别标出“被点击的这一天”上的复习任务，可以用另一种颜色
+    // 例如：红色高亮被点击的日期
+    QTextCharFormat clickedFormat;
+    clickedFormat.setBackground(Qt::red);
+    ui->calendarReview->setDateTextFormat(date, clickedFormat);
 }
 
 void MainWindow::loadKnowledgePoints()
 {
-    qDebug() << "Loading knowledge points...";
+    qDebug() << "Loading knowledge points from JSON...";
 
-    QSettings settings("MyCompany", "KnowledgeReview");
+    // 构建 JSON 文件路径（可执行文件同目录下的 knowledge.json）
+    QString filePath = QCoreApplication::applicationDirPath() + "/knowledge.json";
+    qDebug() << "JSON file path:" << filePath;
 
-    qDebug() << "设置文件路径:" << settings.fileName();
-    qDebug() << "组织名称:" << settings.organizationName();
-    qDebug() << "应用名称:" << settings.applicationName();
-
-    // 列出所有现有的键
-    qDebug() << "所有配置键:";
-    foreach (QString key, settings.allKeys()) {
-        qDebug() << key << ":" << settings.value(key).toString();
+    QFile file(filePath);
+    if (!file.exists()) {
+        qDebug() << "No knowledge.json found, starting with empty data.";
+        knowledgePoints.clear();
+        nextId = 1;
+        return;
     }
 
-    int count = settings.value("knowledgeCount", 0).toInt();
-    qDebug() << "Found" << count << "knowledge points in settings";
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qWarning() << "Failed to open knowledge.json:" << file.errorString();
+        return;
+    }
+
+    QByteArray data = file.readAll();
+    file.close();
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
+    if (parseError.error != QJsonParseError::NoError) {
+        qWarning() << "JSON parse error:" << parseError.errorString();
+        return;
+    }
+
+    if (!doc.isArray()) {
+        qWarning() << "JSON root is not an array!";
+        return;
+    }
+
+    QJsonArray array = doc.array();
+    qDebug() << "Found" << array.size() << "knowledge points in JSON";
 
     knowledgePoints.clear();
     nextId = 1;
 
-    for (int i = 0; i < count; ++i) {
-        QString prefix = QString("point_%1_").arg(i);
+    for (const QJsonValue &val : array) {
+        QJsonObject obj = val.toObject();
 
-        // 检查必要的键是否存在
-        if (!settings.contains(prefix + "id") ||
-            !settings.contains(prefix + "title")) {
-            qDebug() << "Skipping invalid entry at index" << i;
+        // 检查必要字段是否存在
+        if (!obj.contains("id") || !obj.contains("title")) {
+            qDebug() << "Skipping invalid entry (missing id or title)";
             continue;
         }
 
         KnowledgePoint point;
-        point.id = settings.value(prefix + "id").toInt();
-        point.title = settings.value(prefix + "title").toString();
-        point.content = settings.value(prefix + "content").toString();
-        point.imagePath = settings.value(prefix + "imagePath").toString();
-        point.category = settings.value(prefix + "category").toString();
-        point.status = static_cast<KnowledgeStatus>(settings.value(prefix + "status").toInt());
-        point.masteryLevel = settings.value(prefix + "masteryLevel").toInt();
-        point.createDate = settings.value(prefix + "createDate").toDate();
-        point.lastReviewDate = settings.value(prefix + "lastReviewDate").toDate();
-        point.nextReviewDate = settings.value(prefix + "nextReviewDate").toDate();
-        point.reviewCount = settings.value(prefix + "reviewCount").toInt();
+        point.id = obj["id"].toInt();
+        point.title = obj["title"].toString();
+        point.content = obj["content"].toString();
+        point.imagePath = obj["imagePath"].toString();
+        point.category = obj["category"].toString();
+        point.status = static_cast<KnowledgeStatus>(obj["status"].toInt());
+        point.masteryLevel = obj["masteryLevel"].toInt();
+        point.createDate = QDate::fromString(obj["createDate"].toString(), Qt::ISODate);
+        point.lastReviewDate = QDate::fromString(obj["lastReviewDate"].toString(), Qt::ISODate);
+        point.nextReviewDate = QDate::fromString(obj["nextReviewDate"].toString(), Qt::ISODate);
+        point.reviewCount = obj["reviewCount"].toInt();
 
         // 验证数据有效性
         if (point.id <= 0 || point.title.isEmpty()) {
@@ -501,56 +552,116 @@ void MainWindow::loadKnowledgePoints()
     qDebug() << "Total loaded:" << knowledgePoints.size() << "valid knowledge points";
 }
 
+
+//知识点写入，每次都是整个写入读取
 void MainWindow::saveKnowledgePoints()
 {
-    qDebug() << "Saving" << knowledgePoints.size() << "knowledge points...";
+    qDebug() << "Saving" << knowledgePoints.size() << "knowledge points to JSON...";
 
     // 阻塞所有可能触发刷新的信号
     bool oldListState = ui->listKnowledgePoints->blockSignals(true);
     bool oldComboState = ui->comboStatus->blockSignals(true);
 
-    QSettings settings("MyCompany", "KnowledgeReview");
-
     // 将知识点列表按下次复习时间排序（由近到远）
     QList<KnowledgePoint> sortedPoints = knowledgePoints.values();
 
-    // 使用稳定排序，按下次复习时间升序排列（最近的在前）
     std::sort(sortedPoints.begin(), sortedPoints.end(),
               [](const KnowledgePoint &a, const KnowledgePoint &b) {
                   return a.nextReviewDate < b.nextReviewDate;
               });
 
-    // 保存排序后的知识点数量
-    settings.setValue("knowledgeCount", sortedPoints.size());
-
-    int index = 0;
+    // 构建 JSON 数组
+    QJsonArray jsonArray;
     for (const auto &point : sortedPoints) {
-        QString prefix = QString("point_%1_").arg(index);
+        QJsonObject obj;
+        obj["id"] = point.id;
+        obj["title"] = point.title;
+        obj["content"] = point.content;
+        obj["imagePath"] = point.imagePath;
+        obj["category"] = point.category;
+        obj["status"] = static_cast<int>(point.status);
+        obj["masteryLevel"] = point.masteryLevel;
+        obj["createDate"] = point.createDate.toString(Qt::ISODate);
+        obj["lastReviewDate"] = point.lastReviewDate.toString(Qt::ISODate);
+        obj["nextReviewDate"] = point.nextReviewDate.toString(Qt::ISODate);
+        obj["reviewCount"] = point.reviewCount;
 
-        settings.setValue(prefix + "id", point.id);
-        settings.setValue(prefix + "title", point.title);
-        settings.setValue(prefix + "content", point.content);
-        settings.setValue(prefix + "imagePath", point.imagePath);
-        settings.setValue(prefix + "category", point.category);
-        settings.setValue(prefix + "status", static_cast<int>(point.status));
-        settings.setValue(prefix + "masteryLevel", point.masteryLevel);
-        settings.setValue(prefix + "createDate", point.createDate);
-        settings.setValue(prefix + "lastReviewDate", point.lastReviewDate);
-        settings.setValue(prefix + "nextReviewDate", point.nextReviewDate);
-        settings.setValue(prefix + "reviewCount", point.reviewCount);
+        jsonArray.append(obj);
 
-        qDebug() << "Saved point:" << point.id << point.title;
-        index++;
+        qDebug() << "Prepared point for saving:" << point.id << point.title;
     }
 
-    settings.sync(); // 确保数据写入磁盘
+    QJsonDocument doc(jsonArray);
+
+    // 写入文件
+    QString filePath = QCoreApplication::applicationDirPath() + "/knowledge.json";
+    QFile file(filePath);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        file.write(doc.toJson(QJsonDocument::Indented));
+        file.close();
+        qDebug() << "Data saved successfully to" << filePath;
+
+        // ---- 新增：每日备份逻辑 ----
+        QDate today = QDate::currentDate();
+        if (m_lastBackupDate != today) {
+            // 首次备份前先清理旧文件
+            cleanOldBackups();
+
+            QString backupDir = getBackupPath();
+            QString backupFilePath = backupDir + QString("/knowledge_%1.json").arg(today.toString("yyyy-MM-dd"));
+
+            if (QFile::copy(filePath, backupFilePath)) {
+                qDebug() << "Backup created:" << backupFilePath;
+                m_lastBackupDate = today;   // 更新最后备份日期
+            } else {
+                qWarning() << "Failed to create backup!";
+            }
+        }
+        // ---- 备份结束 ----
+    } else {
+        qWarning() << "Failed to save knowledge.json:" << file.errorString();
+    }
 
     // 恢复信号状态
     ui->listKnowledgePoints->blockSignals(oldListState);
     ui->comboStatus->blockSignals(oldComboState);
-
-    qDebug() << "Data saved successfully, software continues to run";
 }
+
+// 获取备份文件夹路径（程序目录下的 backups）
+
+QString MainWindow::getBackupPath() const
+{
+    QString path = QCoreApplication::applicationDirPath() + "/backups";
+    QDir dir(path);
+    if (!dir.exists()) {
+        dir.mkpath(".");
+    }
+    return path;
+}
+
+// 清理旧备份，只保留最近 7 天的文件
+
+void MainWindow::cleanOldBackups() const
+{
+    QString backupDir = getBackupPath();
+    QDir dir(backupDir);
+    QStringList filters;
+    filters << "knowledge_*.json";
+    QFileInfoList files = dir.entryInfoList(filters, QDir::Files, QDir::Name);
+
+    QDate cutoff = QDate::currentDate().addDays(-7);
+    for (const QFileInfo &info : files) {
+        // 从文件名提取日期，格式：knowledge_2026-04-25.json
+        QString name = info.baseName();           // knowledge_2026-04-25
+        QString dateStr = name.mid(10);           // 2026-04-25 （"knowledge_"长度为10）
+        QDate fileDate = QDate::fromString(dateStr, "yyyy-MM-dd");
+        if (fileDate.isValid() && fileDate < cutoff) {
+            QFile::remove(info.absoluteFilePath());
+            qDebug() << "Removed old backup:" << info.fileName();
+        }
+    }
+}
+
 
 void MainWindow::refreshKnowledgeList()
 {
@@ -715,7 +826,9 @@ void MainWindow::showKnowledgePointDetails(int id)
     qDebug() << "Showing details for:" << point.title;
 
     // 显示基本信息
+    ui->textquestion->setPlainText(point.title);
     ui->textContent->setPlainText(point.content);
+    hideContentInTextEdit();
 
     // 显示图片
     displayImage(point.imagePath);
@@ -749,6 +862,8 @@ void MainWindow::showKnowledgePointDetails(int id)
     qDebug() << "Details shown successfully";
 }
 
+
+//添加知识点模块
 void MainWindow::addKnowledgePoint(const QString &title, const QString &content,
                                    const QString &imagePath, const QString &category)
 {
@@ -802,6 +917,7 @@ void MainWindow::editKnowledgePoint(int id, const QString &title, const QString 
     point.category = category;
 
     // 不再立即保存
+    saveKnowledgePoints();   // 立即持久化
     refreshKnowledgeList();
     showKnowledgePointDetails(id);
 }
@@ -820,9 +936,10 @@ void MainWindow::markAsReviewed(int id,int reviewvalue)
 
     point.lastReviewDate = QDate::currentDate();
     if(reviewvalue==-5||reviewvalue==-10){
-        point.reviewCount=0;
+        point.reviewCount = 1;   // 重置为第一次复习后的状态
+    } else {
+        point.reviewCount++;
     }
-    point.reviewCount++;
     point.reviewtureCount++;
 
     // 根据记忆曲线计算下次复习时间
@@ -1001,22 +1118,25 @@ QString MainWindow::getImageStoragePath()
     return imageDirPath;
 }
 
+
+//目录创建
 bool MainWindow::ensureImageStorageDirectory()
 {
-    QDir imageDir(m_imageStoragePath);
+    QDir imageDir(m_imageStoragePath); //构造QDIR就可以对该目录做遍历等各种操作
     if (!imageDir.exists()) {
-        return imageDir.mkpath(".");
+        return imageDir.mkpath(".");  //一次性创建一系列不存在目录
     }
     return true;
 }
 
+//复制文件函数
 QString MainWindow::copyImageToStorage(const QString &sourceImagePath)
 {
     if (sourceImagePath.isEmpty()) {
         return "";
     }
 
-    QFileInfo sourceFileInfo(sourceImagePath);
+    QFileInfo sourceFileInfo(sourceImagePath);  //专门输出文件的各种信息，大小，存在，类型等
     if (!sourceFileInfo.exists() || !sourceFileInfo.isFile()) {
         qDebug() << "Source image file does not exist:" << sourceImagePath;
         return "";
@@ -1040,7 +1160,7 @@ QString MainWindow::copyImageToStorage(const QString &sourceImagePath)
     }
 
     QString targetFileName = baseName + "." + extension;
-    QString targetFilePath = QDir(m_imageStoragePath).filePath(targetFileName);
+    QString targetFilePath = QDir(m_imageStoragePath).filePath(targetFileName);  //专有拼凑语言，将合成文件名放入打算复制的路径
 
     // 复制文件
     if (QFile::copy(sourceImagePath, targetFilePath)) {
@@ -1095,46 +1215,137 @@ void MainWindow::handleImageClicked()
 void MainWindow::on_familiarButton_clicked()
 {
     QListWidgetItem *currentItem = ui->listKnowledgePoints->currentItem();
+    if (!currentItem) return;
     int id = currentItem->data(Qt::UserRole).toInt();
     int reviewvalue=10;
     markAsReviewed(id,reviewvalue);
+    if (m_isReviewMode) {
+        nextReviewItem();
+    }
 }
 
 
 void MainWindow::on_indistinctButton_clicked()
 {
     QListWidgetItem *currentItem = ui->listKnowledgePoints->currentItem();
+    if (!currentItem) return;
     int id = currentItem->data(Qt::UserRole).toInt();
     int reviewvalue=-5;
     markAsReviewed(id,reviewvalue);
+    if (m_isReviewMode) {
+        nextReviewItem();
+    }
 }
 
 
 void MainWindow::on_forgetButton_clicked()
 {
     QListWidgetItem *currentItem = ui->listKnowledgePoints->currentItem();
+    if (!currentItem) return; //防止空指针
     int id = currentItem->data(Qt::UserRole).toInt();
     int reviewvalue=-10;
     markAsReviewed(id,reviewvalue);
+    if (m_isReviewMode) {
+        nextReviewItem();
+    }
 }
 
-// void MainWindow::debugDataSources()
-// {
-//     qDebug() << "=== 数据源调试信息 ===";
 
-//     // 1. 检查注册表
-//     QSettings settings("MyCompany", "KnowledgeReview");
-//     qDebug() << "注册表知识点数量:" << settings.value("knowledgeCount", 0).toInt();
+void MainWindow::on_showcontent_clicked()
+{
+    showContentInTextEdit();
+}
 
-//     // 2. 检查内存中的数据
-//     qDebug() << "内存中知识点数量:" << knowledgePoints.size();
-//     qDebug() << "内存中知识点ID列表:" << knowledgePoints.keys();
+void MainWindow::hideContentInTextEdit()
+{
+    // 设置文字颜色与背景同色（假设背景是白色）
+    // ui->textContent->setStyleSheet("QPlainTextEdit { color: white; background-color: white; }");
+    ui->textContent->setStyleSheet("color: transparent;");
+    // 或者仅修改文字颜色，背景保留原样： color: transparent; 也可以用
+    // ui->textContent->setStyleSheet("QPlainTextEdit { color: transparent; }");
+}
 
-//     // 3. 检查文件数据
-//     QFileInfoList dataFiles = QDir(".").entryInfoList(
-//         QStringList() << "*.dat" << "*.json" << "*.db" << "*.ini");
-//     foreach (QFileInfo file, dataFiles) {
-//         qDebug() << "发现数据文件:" << file.fileName() << "大小:" << file.size();
-//     }
-// }
+void MainWindow::showContentInTextEdit()
+{
+    // 恢复为正常黑色文字，背景保持原样
+    // ui->textContent->setStyleSheet("QPlainTextEdit { color: black; }");
+    ui->textContent->setStyleSheet("");
+}
 
+
+// 启动每日复习：收集当天需复习且未掌握的知识点
+void MainWindow::startDailyReview()
+{
+    QDate today = QDate::currentDate();
+    m_reviewQueue.clear();
+
+    // 按下次复习时间的升序收集（越早越优先）
+    QList<KnowledgePoint> points = knowledgePoints.values();
+    std::sort(points.begin(), points.end(),
+              [](const KnowledgePoint &a, const KnowledgePoint &b) {
+                  return a.nextReviewDate < b.nextReviewDate;
+              });
+
+    for (const auto &point : points) {
+        if (point.nextReviewDate <= today && point.status != STATUS_MASTERED) {
+            m_reviewQueue.append(point.id);
+        }
+    }
+
+    if (m_reviewQueue.isEmpty()) {
+        ui->textquestion->setPlainText("今日没有需要复习的知识点，你可以自由学习。");
+        return;
+    }
+
+    m_isReviewMode = true;
+    m_currentReviewIndex = 0;
+    showCurrentReviewItem();
+    handleCalendarClicked(QDate::currentDate());
+}
+
+// 显示当前复习队列中的知识点
+void MainWindow::showCurrentReviewItem()
+{
+    if (m_currentReviewIndex < 0 || m_currentReviewIndex >= m_reviewQueue.size()) {
+        endReviewMode();
+        return;
+    }
+
+    int id = m_reviewQueue[m_currentReviewIndex];
+
+    // 在列表中同步选中该项（屏蔽信号避免触发选择变更处理）
+    bool blocked = ui->listKnowledgePoints->blockSignals(true);
+    for (int i = 0; i < ui->listKnowledgePoints->count(); ++i) {
+        QListWidgetItem *item = ui->listKnowledgePoints->item(i);
+        if (item->data(Qt::UserRole).toInt() == id) {
+            ui->listKnowledgePoints->setCurrentItem(item);
+            break;
+        }
+    }
+    ui->listKnowledgePoints->blockSignals(blocked);
+
+    // 显示详细内容（包括标题、图片、状态等）
+    showKnowledgePointDetails(id);
+}
+
+// 切换到下一个复习项
+void MainWindow::nextReviewItem()
+{
+    m_currentReviewIndex++;
+    if (m_currentReviewIndex >= m_reviewQueue.size()) {
+        endReviewMode();
+    } else {
+        showCurrentReviewItem();
+    }
+}
+
+// 结束复习模式
+void MainWindow::endReviewMode()
+{
+    m_isReviewMode = false;
+    m_reviewQueue.clear();
+    m_currentReviewIndex = -1;
+    ui->textquestion->setPlainText("今日复习已完成！");
+    // 可选：弹出提示
+    QMessageBox::information(this, "复习完成", "恭喜！今日复习任务已全部完成。");
+}
